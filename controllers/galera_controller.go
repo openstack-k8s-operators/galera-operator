@@ -85,6 +85,8 @@ func execInPod(r *GaleraReconciler, namespace string, pod string, container stri
 	})
 
 	if err != nil {
+		log := r.Log.WithValues("galera", namespace)
+		log.Error(err, "Failed to exec into container", "Galera.Namespace", namespace, "Galera.Name", pod)
 		return err
 	}
 
@@ -427,12 +429,13 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		log.Info("Pushing gcomm URI to bootstrap", "pod", node)
 
 		rc := execInPod(r, galera.Namespace, node, "galera",
-			[]string{"/bin/bash", "-c", "echo '" + uri + "' > /tmp/gcomm_uri"},
+			[]string{"/bin/bash", "-c", "echo '" + uri + "' > /var/lib/mysql/gcomm_uri"},
 			func(stdout *bytes.Buffer, stderr *bytes.Buffer) error {
 				attr := galera.Status.Attributes[node]
 				attr.Gcomm = uri
 				galera.Status.Attributes[node] = attr
 				galera.Status.Bootstrapped = true
+				log.Info("Pushing gcomm URI to bootstrap", "pod", node)
 				return nil
 			})
 		if rc != nil {
@@ -462,7 +465,7 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			log.Info("Pushing gcomm URI to joiner", "pod", node)
 
 			rc := execInPod(r, galera.Namespace, node, "galera",
-				[]string{"/bin/bash", "-c", "echo '" + uri + "' > /tmp/gcomm_uri"},
+				[]string{"/bin/bash", "-c", "echo '" + uri + "' > /var/lib/mysql/gcomm_uri"},
 				func(stdout *bytes.Buffer, stderr *bytes.Buffer) error {
 					attr.Gcomm = uri
 					galera.Status.Attributes[node] = attr
@@ -505,6 +508,7 @@ func (r *GaleraReconciler) statefulSetForGalera(m *databasev1beta1.Galera) *apps
 			Selector: &metav1.LabelSelector{
 				MatchLabels: ls,
 			},
+			PodManagementPolicy: "Parallel",
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: ls,
@@ -559,7 +563,7 @@ func (r *GaleraReconciler) statefulSetForGalera(m *databasev1beta1.Galera) *apps
 						Image: m.Spec.ContainerImage,
 						// ImagePullPolicy: "Always",
 						Name:    "galera",
-						Command: []string{"kolla_start"},
+						Command: []string{"/usr/bin/dumb-init", "--", "/usr/local/bin/kolla_start"},
 						Env: []corev1.EnvVar{{
 							Name:  "KOLLA_CONFIG_STRATEGY",
 							Value: "COPY_ALWAYS",
@@ -607,6 +611,15 @@ func (r *GaleraReconciler) statefulSetForGalera(m *databasev1beta1.Galera) *apps
 							ReadOnly:  true,
 							Name:      "kolla-config",
 						}},
+						StartupProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								Exec: &corev1.ExecAction{
+									Command: []string{"/bin/bash", "/var/lib/operator-scripts/mysql_probe.sh", "startup"},
+								},
+							},
+							PeriodSeconds:    10,
+							FailureThreshold: 30,
+						},
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								Exec: &corev1.ExecAction{
@@ -773,6 +786,7 @@ func (r *GaleraReconciler) headlessServiceForGalera(m *databasev1beta1.Galera) *
 			Selector: map[string]string{
 				"app": name,
 			},
+			PublishNotReadyAddresses: true,
 		},
 	}
 	// Set Galera instance as the owner and controller
