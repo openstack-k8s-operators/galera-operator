@@ -16,7 +16,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.12.3
 )
 
-require github.com/openstack-k8s-operators/lib-common/modules/common v0.0.0-20220819100430-0319abfd42d9
+require github.com/openstack-k8s-operators/lib-common/modules/common v0.0.0-20221103175706-2c39582ce513
 
 require (
 	cloud.google.com/go v0.81.0 // indirect

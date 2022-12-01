@@ -17,6 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
+	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -36,6 +37,9 @@ type MariaDBSpec struct {
 type MariaDBStatus struct {
 	// db init completed
 	DbInitHash string `json:"dbInitHash"`
+
+	// Conditions
+	Conditions condition.Conditions `json:"conditions,omitempty" optional:"true"`
 }
 
 //+kubebuilder:object:root=true
@@ -62,3 +66,5 @@ type MariaDBList struct {
 func init() {
 	SchemeBuilder.Register(&MariaDB{}, &MariaDBList{})
 }
+
+

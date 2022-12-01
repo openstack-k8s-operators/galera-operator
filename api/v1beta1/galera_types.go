@@ -17,6 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
+	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -33,6 +34,14 @@ type GaleraSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// Size of the galera cluster deployment
 	Size int32 `json:"size"`
+	// Adoption configuration
+	AdoptionRedirect AdoptionRedirectSpec `json:"adoptionRedirect,omitempty"`
+}
+
+// AdoptionRedirectSpec defines redirection to a different DB instance during Adoption
+type AdoptionRedirectSpec struct {
+	// MariaDB host to redirect to (IP or name)
+	Host string `json:"host,omitempty"`
 }
 
 // GaleraAttributes holds startup information for a Galera host
@@ -51,6 +60,8 @@ type GaleraStatus struct {
 	SafeToBootstrap string `json:"safeToBootstrap,omitempty"`
 	// Is the galera cluster currently running
 	Bootstrapped bool `json:"bootstrapped"`
+	// Deployment Conditions
+	Conditions condition.Conditions `json:"conditions,omitempty" optional:"true"`
 }
 
 // +kubebuilder:object:root=true
@@ -76,4 +87,9 @@ type GaleraList struct {
 
 func init() {
 	SchemeBuilder.Register(&Galera{}, &GaleraList{})
+}
+
+// IsReady - returns true if service is ready to serve requests
+func (instance Galera) IsReady() bool {
+	return instance.Status.Conditions.IsTrue(condition.DeploymentReadyCondition)
 }

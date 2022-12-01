@@ -17,6 +17,7 @@ limitations under the License.
 package controllers
 
 import (
+	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
 	configmap "github.com/openstack-k8s-operators/lib-common/modules/common/configmap"
 	env "github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
@@ -24,11 +25,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	resource "k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"bytes"
 	"context"
@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	databasev1beta1 "github.com/openstack-k8s-operators/galera-operator/api/v1beta1"
+	mariadb "github.com/openstack-k8s-operators/galera-operator/pkg"
 )
 
 // GaleraReconciler reconciles a Galera object
@@ -58,6 +59,7 @@ type GaleraReconciler struct {
 	Scheme  *runtime.Scheme
 }
 
+// TODO move it to utils
 func execInPod(r *GaleraReconciler, namespace string, pod string, container string, cmd []string, fun func(*bytes.Buffer, *bytes.Buffer) error) error {
 	req := r.Kclient.CoreV1().RESTClient().Post().Resource("pods").Name(pod).Namespace(namespace).SubResource("exec").Param("container", container)
 	req.VersionedParams(
@@ -113,9 +115,9 @@ func findBestCandidate(status *databasev1beta1.GaleraStatus) string {
 	return bestnode //"galera-0"
 }
 
-func buildGcommURI(galera *databasev1beta1.Galera) string {
-	size := int(galera.Spec.Size)
-	basename := galera.Name + "-galera"
+func buildGcommURI(instance *databasev1beta1.Galera) string {
+	size := int(instance.Spec.Size)
+	basename := instance.Name + "-galera"
 	res := []string{}
 
 	for i := 0; i < size; i++ {
@@ -154,11 +156,10 @@ func buildGcommURI(galera *databasev1beta1.Galera) string {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.7.0/pkg/reconcile
 func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("galera", req.NamespacedName)
-	resName := resourceNameForGalera(req.NamespacedName.Name)
 
 	// Fetch the Galera instance
-	galera := &databasev1beta1.Galera{}
-	err := r.Get(ctx, req.NamespacedName, galera)
+	instance := &databasev1beta1.Galera{}
+	err := r.Get(ctx, req.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -172,8 +173,31 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	//
+	// initialize status
+	//
+	if instance.Status.Conditions == nil {
+		instance.Status.Conditions = condition.Conditions{}
+		// initialize conditions used later as Status=Unknown
+		cl := condition.CreateList(
+			// endpoint for adoption redirect
+			condition.UnknownCondition(condition.ExposeServiceReadyCondition, condition.InitReason, condition.ExposeServiceReadyInitMessage),
+			// configmap generation
+			condition.UnknownCondition(condition.ServiceConfigReadyCondition, condition.InitReason, condition.ServiceConfigReadyInitMessage),
+			// cluster bootstrap
+			condition.UnknownCondition(condition.DeploymentReadyCondition, condition.InitReason, condition.DeploymentReadyInitMessage),
+		)
+
+		instance.Status.Conditions.Init(&cl)
+
+		// Register overall status immediately to have an early feedback e.g. in the cli
+		if err := r.Client.Status().Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	helper, err := helper.NewHelper(
-		galera,
+		instance,
 		r.Client,
 		r.Kclient,
 		r.Scheme,
@@ -183,133 +207,146 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// Check if the mariadb shim object already exists, if not create a new one
-	mdbfound := &databasev1beta1.MariaDB{}
-	mdbname := types.NamespacedName{Namespace: req.NamespacedName.Namespace, Name: req.NamespacedName.Name}
-	err = r.Get(ctx, mdbname, mdbfound)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new MariaDB object
-		mdb := r.mariadbShimForGalera(galera)
-		log.Info("Creating a new MariaDB", "MariaDB.Namespace", mdbname.Namespace, "MariaDB.Name", mdbname.Name)
-		err = r.Create(ctx, mdb)
-		if err != nil {
-			log.Error(err, "Failed to create new MariaDB", "MariaDB.Namespace", mdbname.Namespace, "MariaDB.Name", mdbname.Name)
-			return ctrl.Result{}, err
+	// // Always patch the instance status when exiting this function so we can persist any changes.
+	defer func() {
+		// update the overall status condition if service is ready
+		if instance.IsReady() {
+			instance.Status.Conditions.MarkTrue(condition.ReadyCondition, condition.ReadyMessage)
 		}
-		// StatefulSet created successfully - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		log.Error(err, "Failed to get MariaDB")
+
+		if err := helper.SetAfter(instance); err != nil {
+			util.LogErrorForObject(helper, err, "Set after and calc patch/diff", instance)
+		}
+
+		if changed := helper.GetChanges()["status"]; changed {
+			patch := client.MergeFrom(helper.GetBeforeObject())
+
+			if err := r.Client.Status().Patch(ctx, instance, patch); err != nil && !k8s_errors.IsNotFound(err) {
+				util.LogErrorForObject(helper, err, "Update status", instance)
+			}
+		}
+	}()
+
+	shim := mariadb.MariaDBShim(instance)
+	op, err := controllerutil.CreateOrPatch(ctx, r.Client, shim, func() error {
+		err := controllerutil.SetOwnerReference(instance, shim, r.Client.Scheme())
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if op != controllerutil.OperationResultNone {
+		r.Log.Info(fmt.Sprintf("%s %s database shim %s - operation: %s", instance.Kind, instance.Name, shim.Name, string(op)))
+		return ctrl.Result{RequeueAfter: time.Second * 5}, err
+	}
 
-	// Check if the StatefulSet already exists, if not create a new one
-	found := &appsv1.StatefulSet{}
-	ssetname := types.NamespacedName{Namespace: req.NamespacedName.Namespace, Name: resName}
-	err = r.Get(ctx, ssetname, found)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new StatefulSet
-		dep := r.statefulSetForGalera(galera)
-		log.Info("Creating a new StatefulSet", "StatefulSet.Namespace", dep.Namespace, "StatefulSet.Name", dep.Name)
-		err = r.Create(ctx, dep)
+	// Endpoints
+	endpoints := mariadb.Endpoints(instance)
+	if endpoints != nil {
+		op, err = controllerutil.CreateOrPatch(ctx, r.Client, endpoints, func() error {
+			err := controllerutil.SetControllerReference(instance, endpoints, r.Scheme)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 		if err != nil {
-			log.Error(err, "Failed to create new StatefulSet", "StatefulSet.Namespace", dep.Namespace, "StatefulSet.Name", dep.Name)
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.ExposeServiceReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.ExposeServiceReadyErrorMessage,
+				err.Error()))
 			return ctrl.Result{}, err
 		}
-		// StatefulSet created successfully - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		log.Error(err, "Failed to get StatefulSet")
-		return ctrl.Result{}, err
-	}
-
-	// Check if the headless service already exists, if not create a new one
-	hsvcfound := &corev1.Service{}
-	hsvcname := types.NamespacedName{Namespace: req.NamespacedName.Namespace, Name: resName}
-	err = r.Get(ctx, hsvcname, hsvcfound)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new headless service
-		hsvc := r.headlessServiceForGalera(galera)
-		log.Info("Creating a new headless Service", "StatefulSet.Namespace", hsvc.Namespace, "StatefulSet.Name", hsvc.Name)
-		err = r.Create(ctx, hsvc)
-		if err != nil {
-			log.Error(err, "Failed to create new headless Service", "StatefulSet.Namespace", hsvc.Namespace, "StatefulSet.Name", hsvc.Name)
-			return ctrl.Result{}, err
+		if op != controllerutil.OperationResultNone {
+			r.Log.Info(fmt.Sprintf("Endpoints %s successfully reconciled - operation: %s", endpoints.Name, string(op)))
+			return ctrl.Result{RequeueAfter: time.Second * 5}, err
 		}
-		// headless service created successfully - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		log.Error(err, "Failed to get headless Service")
-		return ctrl.Result{}, err
 	}
 
-	// Check if the main mysql service already exists, if not create a new one
-	svcfound := &corev1.Service{}
-	nsname := types.NamespacedName{Namespace: req.NamespacedName.Namespace, Name: "openstack"}
-	err = r.Get(ctx, nsname, svcfound)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new headless service
-		svc := r.serviceForGalera(galera)
-		log.Info("Creating a new Service", "StatefulSet.Namespace", svc.Namespace, "StatefulSet.Name", svc.Name)
-		err = r.Create(ctx, svc)
+	instance.Status.Conditions.MarkTrue(condition.ExposeServiceReadyCondition, condition.ExposeServiceReadyMessage)
+
+	statefulset := mariadb.StatefulSet(instance)
+	op, err = controllerutil.CreateOrPatch(ctx, r.Client, statefulset, func() error {
+		err := controllerutil.SetOwnerReference(instance, statefulset, r.Client.Scheme())
 		if err != nil {
-			log.Error(err, "Failed to create main Service", "StatefulSet.Namespace", svc.Namespace, "StatefulSet.Name", svc.Name)
-			return ctrl.Result{}, err
+			return err
 		}
-		// service created successfully - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		log.Error(err, "Failed to get Service")
+		return nil
+	})
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	customData := make(map[string]string)
-	templateParameters := make(map[string]interface{})
-
-	cms := []util.Template{
-		// ScriptsConfigMap
-		{
-			Name:         fmt.Sprintf("%s-scripts", galera.Name),
-			Namespace:    galera.Namespace,
-			Type:         util.TemplateTypeScripts,
-			InstanceType: galera.Kind,
-			AdditionalTemplate: map[string]string{
-				"mysql_bootstrap.sh":        "/galera/bin/mysql_bootstrap.sh",
-				"mysql_probe.sh":            "/galera/bin/mysql_probe.sh",
-				"detect_last_commit.sh":     "/galera/bin/detect_last_commit.sh",
-				"detect_gcomm_and_start.sh": "/galera/bin/detect_gcomm_and_start.sh",
-			},
-			Labels: map[string]string{},
-		},
-		// ConfigMap
-		{
-			Name:          fmt.Sprintf("%s-config-data", galera.Name),
-			Namespace:     galera.Namespace,
-			Type:          util.TemplateTypeConfig,
-			InstanceType:  galera.Kind,
-			CustomData:    customData,
-			ConfigOptions: templateParameters,
-			Labels:        map[string]string{},
-		},
+	if op != controllerutil.OperationResultNone {
+		r.Log.Info(fmt.Sprintf("%s %s database stateful %s - operation: %s", instance.Kind, instance.Name, statefulset.Name, string(op)))
+		return ctrl.Result{RequeueAfter: time.Second * 5}, err
 	}
 
-	envVars := make(map[string]env.Setter)
-
-	errmap := configmap.EnsureConfigMaps(ctx, helper, galera, cms, &envVars)
-	if errmap != nil {
-		log.Error(errmap, "Unable to retrieve or create config maps")
-		return ctrl.Result{}, errmap
+	headless := mariadb.HeadlessService(instance)
+	op, err = controllerutil.CreateOrPatch(ctx, r.Client, headless, func() error {
+		err := controllerutil.SetOwnerReference(instance, headless, r.Client.Scheme())
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	if op != controllerutil.OperationResultNone {
+		r.Log.Info(fmt.Sprintf("%s %s database headless service %s - operation: %s", instance.Kind, instance.Name, headless.Name, string(op)))
+		return ctrl.Result{RequeueAfter: time.Second * 5}, err
+	}
+
+	service := mariadb.Service(instance)
+	op, err = controllerutil.CreateOrPatch(ctx, r.Client, service, func() error {
+		err := controllerutil.SetOwnerReference(instance, service, r.Client.Scheme())
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if op != controllerutil.OperationResultNone {
+		r.Log.Info(fmt.Sprintf("%s %s database service %s - operation: %s", instance.Kind, instance.Name, service.Name, string(op)))
+		return ctrl.Result{RequeueAfter: time.Second * 5}, err
+	}
+
+	// Generate the config maps for the various services
+	configMapVars := make(map[string]env.Setter)
+	err = r.generateConfigMaps(ctx, helper, instance, &configMapVars)
+	if err != nil {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.ServiceConfigReadyCondition,
+			condition.ErrorReason,
+			condition.SeverityWarning,
+			condition.ServiceConfigReadyErrorMessage,
+			err.Error()))
+		return ctrl.Result{}, fmt.Errorf("error calculating configmap hash: %v", err)
+	}
+	// mergedMapVars := env.MergeEnvs([]corev1.EnvVar{}, configMapVars)
+	// configHash := ""
+	// for _, hashEnv := range mergedMapVars {
+	// 	configHash = configHash + hashEnv.Value
+	// }
+
+	instance.Status.Conditions.MarkTrue(condition.ServiceConfigReadyCondition, condition.ServiceConfigReadyMessage)
 
 	// log.Info("*******", "envVars", envVars)
 
 	// Ensure the deployment size is the same as the spec
-	size := galera.Spec.Size
-	if *found.Spec.Replicas != size {
-		found.Spec.Replicas = &size
-		err = r.Update(ctx, found)
+	size := instance.Spec.Size
+	if *statefulset.Spec.Replicas != size {
+		statefulset.Spec.Replicas = &size
+		err = r.Update(ctx, statefulset)
 		if err != nil {
-			log.Error(err, "Failed to update StatefulSet", "StatefulSet.Namespace", found.Namespace, "StatefulSet.Name", found.Name)
+			log.Error(err, "Failed to update StatefulSet", "StatefulSet.Namespace", statefulset.Namespace, "StatefulSet.Name", statefulset.Name)
 			return ctrl.Result{}, err
 		}
 		// Spec updated - return and requeue
@@ -319,11 +356,11 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// List the pods for this galera's deployment
 	podList := &corev1.PodList{}
 	listOpts := []client.ListOption{
-		client.InNamespace(galera.Namespace),
-		client.MatchingLabels(labelsForGalera(galera.Name)),
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(mariadb.GetLabels(instance.Name)),
 	}
 	if err = r.List(ctx, podList, listOpts...); err != nil {
-		log.Error(err, "Failed to list pods", "Galera.Namespace", galera.Namespace, "Galera.Name", galera.Name)
+		log.Error(err, "Failed to list pods", "Galera.Namespace", instance.Namespace, "Galera.Name", instance.Name)
 		return ctrl.Result{}, err
 	}
 
@@ -332,9 +369,9 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if len(podNames) == 0 {
 		log.Info("No pods running, cluster is stopped")
-		galera.Status.Bootstrapped = false
-		galera.Status.Attributes = make(map[string]databasev1beta1.GaleraAttributes)
-		err := r.Status().Update(ctx, galera)
+		instance.Status.Bootstrapped = false
+		instance.Status.Attributes = make(map[string]databasev1beta1.GaleraAttributes)
+		err := r.Status().Update(ctx, instance)
 		if err != nil {
 			log.Error(err, "Failed to update Galera status")
 			return ctrl.Result{}, err
@@ -343,14 +380,14 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	knownNodes := []string{}
-	for k := range galera.Status.Attributes {
+	for k := range instance.Status.Attributes {
 		knownNodes = append(knownNodes, k)
 	}
 	sort.Strings(knownNodes)
 	nodesDiffer := !reflect.DeepEqual(podNames, knownNodes)
 
 	removedNodes := []string{}
-	for k := range galera.Status.Attributes {
+	for k := range instance.Status.Attributes {
 		present := false
 		for _, n := range podNames {
 			if k == n {
@@ -366,10 +403,10 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// In case some pods got deleted, clean the associated internal status
 	if len(removedNodes) > 0 {
 		for _, n := range removedNodes {
-			delete(galera.Status.Attributes, n)
+			delete(instance.Status.Attributes, n)
 		}
 		log.Info("Pod removed, cleaning internal status", "pods", removedNodes)
-		err = r.Status().Update(ctx, galera)
+		err = r.Status().Update(ctx, instance)
 		if err != nil {
 			log.Error(err, "Failed to update Galera status")
 			return ctrl.Result{}, err
@@ -382,28 +419,28 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// scan each pod's database for seqno if not done already
 	if nodesDiffer {
 		log.Info("New pod config detected, wait for pod availability before probing", "podNames", podNames, "knownNodes", knownNodes)
-		if galera.Status.Attributes == nil {
-			galera.Status.Attributes = make(map[string]databasev1beta1.GaleraAttributes)
+		if instance.Status.Attributes == nil {
+			instance.Status.Attributes = make(map[string]databasev1beta1.GaleraAttributes)
 		}
 		for _, pod := range podList.Items {
-			if _, k := galera.Status.Attributes[pod.Name]; !k {
+			if _, k := instance.Status.Attributes[pod.Name]; !k {
 				if pod.Status.Phase == corev1.PodRunning {
 					log.Info("Pod running, retrieve seqno", "pod", pod.Name)
-					rc := execInPod(r, galera.Namespace, pod.Name, "galera",
+					rc := execInPod(r, instance.Namespace, pod.Name, "galera",
 						[]string{"/bin/bash", "/var/lib/operator-scripts/detect_last_commit.sh"},
 						func(stdout *bytes.Buffer, stderr *bytes.Buffer) error {
 							seqno := strings.TrimSuffix(stdout.String(), "\n")
 							attr := databasev1beta1.GaleraAttributes{
 								Seqno: seqno,
 							}
-							galera.Status.Attributes[pod.Name] = attr
+							instance.Status.Attributes[pod.Name] = attr
 							return nil
 						})
 					if rc != nil {
 						log.Error(err, "Failed to retrieve seqno from galera database", "pod", pod.Name, "rc", rc)
 						return ctrl.Result{}, err
 					}
-					err := r.Status().Update(ctx, galera)
+					err := r.Status().Update(ctx, instance)
 					if err != nil {
 						log.Error(err, "Failed to update Galera status")
 						return ctrl.Result{}, err
@@ -421,20 +458,20 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// log.Info("db", "status", galera.Status)
-	bootstrapped := galera.Status.Bootstrapped
-	if !bootstrapped && len(podNames) == len(galera.Status.Attributes) {
-		node := findBestCandidate(&galera.Status)
+	// log.Info("db", "status", instance.Status)
+	bootstrapped := instance.Status.Bootstrapped
+	if !bootstrapped && len(podNames) == len(instance.Status.Attributes) {
+		node := findBestCandidate(&instance.Status)
 		uri := "gcomm://"
 		log.Info("Pushing gcomm URI to bootstrap", "pod", node)
 
-		rc := execInPod(r, galera.Namespace, node, "galera",
+		rc := execInPod(r, instance.Namespace, node, "galera",
 			[]string{"/bin/bash", "-c", "echo '" + uri + "' > /var/lib/mysql/gcomm_uri"},
 			func(stdout *bytes.Buffer, stderr *bytes.Buffer) error {
-				attr := galera.Status.Attributes[node]
+				attr := instance.Status.Attributes[node]
 				attr.Gcomm = uri
-				galera.Status.Attributes[node] = attr
-				galera.Status.Bootstrapped = true
+				instance.Status.Attributes[node] = attr
+				instance.Status.Bootstrapped = true
 				log.Info("Pushing gcomm URI to bootstrap", "pod", node)
 				return nil
 			})
@@ -442,7 +479,10 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			log.Error(err, "Failed to push gcomm URI", "pod", node, "rc", rc)
 			return ctrl.Result{}, rc
 		}
-		err := r.Status().Update(ctx, galera)
+		// TODO: set the condition once one pod is ready?
+		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
+
+		err := r.Status().Update(ctx, instance)
 		if err != nil {
 			log.Error(err, "Failed to update Galera status")
 			return ctrl.Result{}, err
@@ -452,30 +492,30 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if bootstrapped {
-		size := int(galera.Spec.Size)
-		baseName := resourceNameForGalera(galera.Name)
+		size := int(instance.Spec.Size)
+		baseName := mariadb.ResourceName(instance.Name)
 		for i := 0; i < size; i++ {
 			node := baseName + "-" + strconv.Itoa(i)
-			attr, found := galera.Status.Attributes[node]
+			attr, found := instance.Status.Attributes[node]
 			if !found || attr.Gcomm != "" {
 				continue
 			}
 
-			uri := buildGcommURI(galera)
+			uri := buildGcommURI(instance)
 			log.Info("Pushing gcomm URI to joiner", "pod", node)
 
-			rc := execInPod(r, galera.Namespace, node, "galera",
+			rc := execInPod(r, instance.Namespace, node, "galera",
 				[]string{"/bin/bash", "-c", "echo '" + uri + "' > /var/lib/mysql/gcomm_uri"},
 				func(stdout *bytes.Buffer, stderr *bytes.Buffer) error {
 					attr.Gcomm = uri
-					galera.Status.Attributes[node] = attr
+					instance.Status.Attributes[node] = attr
 					return nil
 				})
 			if rc != nil {
 				log.Error(err, "Failed to push gcomm URI", "pod", node, "rc", rc)
 				return ctrl.Result{}, rc
 			}
-			err := r.Status().Update(ctx, galera)
+			err := r.Status().Update(ctx, instance)
 			if err != nil {
 				log.Error(err, "Failed to update Galera status")
 				return ctrl.Result{}, err
@@ -489,353 +529,52 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, nil
 }
 
-// statefulSetForGalera returns a galera StatefulSet object
-func (r *GaleraReconciler) statefulSetForGalera(m *databasev1beta1.Galera) *appsv1.StatefulSet {
-	ls := labelsForGalera(m.Name)
-	name := resourceNameForGalera(m.Name)
-	replicas := m.Spec.Size
-	runAsUser := int64(0)
-	storage := m.Spec.StorageClass
-	storageRequest := resource.MustParse(m.Spec.StorageRequest)
-	dep := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: m.Namespace,
+func (r *GaleraReconciler) generateConfigMaps(
+	ctx context.Context,
+	h *helper.Helper,
+	instance *databasev1beta1.Galera,
+	envVars *map[string]env.Setter,
+) error {
+	// cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(mariadb.ServiceName), map[string]string{})
+	templateParameters := make(map[string]interface{})
+	customData := make(map[string]string)
+
+	cms := []util.Template{
+		// ScriptsConfigMap
+		{
+			Name:         fmt.Sprintf("%s-scripts", instance.Name),
+			Namespace:    instance.Namespace,
+			Type:         util.TemplateTypeScripts,
+			InstanceType: instance.Kind,
+			AdditionalTemplate: map[string]string{
+				"mysql_bootstrap.sh":        "/galera/bin/mysql_bootstrap.sh",
+				"mysql_probe.sh":            "/galera/bin/mysql_probe.sh",
+				"detect_last_commit.sh":     "/galera/bin/detect_last_commit.sh",
+				"detect_gcomm_and_start.sh": "/galera/bin/detect_gcomm_and_start.sh",
+			},
+			Labels: map[string]string{},
 		},
-		Spec: appsv1.StatefulSetSpec{
-			ServiceName: name,
-			Replicas:    &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: ls,
-			},
-			PodManagementPolicy: "Parallel",
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: ls,
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "galera-operator-galera",
-					InitContainers: []corev1.Container{{
-						Image:   m.Spec.ContainerImage,
-						Name:    "mysql-bootstrap",
-						Command: []string{"bash", "/var/lib/operator-scripts/mysql_bootstrap.sh"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser: &runAsUser,
-						},
-						Env: []corev1.EnvVar{{
-							Name:  "KOLLA_BOOTSTRAP",
-							Value: "True",
-						}, {
-							Name:  "KOLLA_CONFIG_STRATEGY",
-							Value: "COPY_ALWAYS",
-						}, {
-							Name: "DB_ROOT_PASSWORD",
-							ValueFrom: &corev1.EnvVarSource{
-								SecretKeyRef: &corev1.SecretKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: m.Spec.Secret,
-									},
-									Key: "DbRootPassword",
-								},
-							},
-						}},
-						VolumeMounts: []corev1.VolumeMount{{
-							MountPath: "/var/lib/mysql",
-							Name:      "mysql-db",
-						}, {
-							MountPath: "/var/lib/config-data",
-							ReadOnly:  true,
-							Name:      "config-data",
-						}, {
-							MountPath: "/var/lib/pod-config-data",
-							Name:      "pod-config-data",
-						}, {
-							MountPath: "/var/lib/operator-scripts",
-							ReadOnly:  true,
-							Name:      "operator-scripts",
-						}, {
-							MountPath: "/var/lib/kolla/config_files",
-							ReadOnly:  true,
-							Name:      "kolla-config",
-						}},
-					}},
-					Containers: []corev1.Container{{
-						Image: m.Spec.ContainerImage,
-						// ImagePullPolicy: "Always",
-						Name:    "galera",
-						Command: []string{"/usr/bin/dumb-init", "--", "/usr/local/bin/kolla_start"},
-						Env: []corev1.EnvVar{{
-							Name:  "KOLLA_CONFIG_STRATEGY",
-							Value: "COPY_ALWAYS",
-						}, {
-							Name: "DB_ROOT_PASSWORD",
-							ValueFrom: &corev1.EnvVarSource{
-								SecretKeyRef: &corev1.SecretKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: m.Spec.Secret,
-									},
-									Key: "DbRootPassword",
-								},
-							},
-						}},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser: &runAsUser,
-						},
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 3306,
-							Name:          "mysql",
-						}, {
-							ContainerPort: 4567,
-							Name:          "galera",
-						}},
-						VolumeMounts: []corev1.VolumeMount{{
-							MountPath: "/var/lib/mysql",
-							Name:      "mysql-db",
-						}, {
-							MountPath: "/var/lib/config-data",
-							ReadOnly:  true,
-							Name:      "config-data",
-						}, {
-							MountPath: "/var/lib/pod-config-data",
-							Name:      "pod-config-data",
-						}, {
-							MountPath: "/var/lib/secrets",
-							ReadOnly:  true,
-							Name:      "secrets",
-						}, {
-							MountPath: "/var/lib/operator-scripts",
-							ReadOnly:  true,
-							Name:      "operator-scripts",
-						}, {
-							MountPath: "/var/lib/kolla/config_files",
-							ReadOnly:  true,
-							Name:      "kolla-config",
-						}},
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								Exec: &corev1.ExecAction{
-									Command: []string{"/bin/bash", "/var/lib/operator-scripts/mysql_probe.sh", "startup"},
-								},
-							},
-							PeriodSeconds:    10,
-							FailureThreshold: 30,
-						},
-						LivenessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								Exec: &corev1.ExecAction{
-									Command: []string{"/bin/bash", "/var/lib/operator-scripts/mysql_probe.sh", "liveness"},
-								},
-							},
-						},
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								Exec: &corev1.ExecAction{
-									Command: []string{"/bin/bash", "/var/lib/operator-scripts/mysql_probe.sh", "readiness"},
-								},
-							},
-						},
-					}},
-					Volumes: []corev1.Volume{
-						{
-							Name: "secrets",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: m.Spec.Secret,
-									Items: []corev1.KeyToPath{
-										{
-											Key:  "DbRootPassword",
-											Path: "dbpassword",
-										},
-									},
-								},
-							},
-						},
-						{
-							Name: "kolla-config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: m.Name + "-config-data",
-									},
-									Items: []corev1.KeyToPath{
-										{
-											Key:  "config.json",
-											Path: "config.json",
-										},
-									},
-								},
-							},
-						},
-						{
-							Name: "pod-config-data",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "config-data",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: m.Name + "-config-data",
-									},
-									Items: []corev1.KeyToPath{
-										{
-											Key:  "galera.cnf.in",
-											Path: "galera.cnf.in",
-										},
-									},
-								},
-							},
-						},
-						{
-							Name: "operator-scripts",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: m.Name + "-scripts",
-									},
-									Items: []corev1.KeyToPath{
-										{
-											Key:  "mysql_bootstrap.sh",
-											Path: "mysql_bootstrap.sh",
-										},
-										{
-											Key:  "mysql_probe.sh",
-											Path: "mysql_probe.sh",
-										},
-										{
-											Key:  "detect_last_commit.sh",
-											Path: "detect_last_commit.sh",
-										},
-										{
-											Key:  "detect_gcomm_and_start.sh",
-											Path: "detect_gcomm_and_start.sh",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:   "mysql-db",
-						Labels: ls,
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{
-							"ReadWriteOnce",
-						},
-						StorageClassName: &storage,
-						Resources: corev1.ResourceRequirements{
-							Requests: corev1.ResourceList{
-								"storage": storageRequest,
-							},
-						},
-					},
-				},
-			},
+		// ConfigMap
+		{
+			Name:          fmt.Sprintf("%s-config-data", instance.Name),
+			Namespace:     instance.Namespace,
+			Type:          util.TemplateTypeConfig,
+			InstanceType:  instance.Kind,
+			CustomData:    customData,
+			ConfigOptions: templateParameters,
+			Labels:        map[string]string{},
 		},
 	}
-	// Set Galera instance as the owner and controller
-	err := ctrl.SetControllerReference(m, dep, r.Scheme)
+
+	// envVars := make(map[string]env.Setter)
+	err := configmap.EnsureConfigMaps(ctx, h, instance, cms, envVars)
 	if err != nil {
-		return nil
+		log := r.Log.WithValues("galera", instance.Namespace)
+		log.Error(err, "Unable to retrieve or create config maps")
+		return err
 	}
-	return dep
-}
 
-func (r *GaleraReconciler) mariadbShimForGalera(m *databasev1beta1.Galera) *databasev1beta1.MariaDB {
-	// ls := labelsForGalera(m.Name)
-	mariadb := &databasev1beta1.MariaDB{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
-		},
-		Spec: databasev1beta1.MariaDBSpec{
-			Secret:         m.Spec.Secret,
-			StorageClass:   m.Spec.StorageClass,
-			StorageRequest: m.Spec.StorageRequest,
-			ContainerImage: m.Spec.ContainerImage,
-		},
-	}
-	err := ctrl.SetControllerReference(m, mariadb, r.Scheme)
-	if err != nil {
-		return nil
-	}
-	return mariadb
-}
-
-func (r *GaleraReconciler) headlessServiceForGalera(m *databasev1beta1.Galera) *corev1.Service {
-	// ls := labelsForGalera(m.Name)
-	name := resourceNameForGalera(m.Name)
-	dep := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: m.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Type:      "ClusterIP",
-			ClusterIP: "None",
-			Ports: []corev1.ServicePort{
-				{Name: "mysql", Protocol: "TCP", Port: 3306},
-			},
-			Selector: map[string]string{
-				"app": name,
-			},
-			PublishNotReadyAddresses: true,
-		},
-	}
-	// Set Galera instance as the owner and controller
-	err := ctrl.SetControllerReference(m, dep, r.Scheme)
-	if err != nil {
-		return nil
-	}
-	return dep
-}
-
-func (r *GaleraReconciler) serviceForGalera(m *databasev1beta1.Galera) *corev1.Service {
-	// ls := labelsForGalera(m.Name)
-	res := resourceNameForGalera(m.Name)
-	dep := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
-			Labels: map[string]string{
-				"app": "mariadb",
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type: "ClusterIP",
-			Ports: []corev1.ServicePort{
-				{Name: "mysql", Protocol: "TCP", Port: 3306},
-			},
-			Selector: map[string]string{
-				"app": res,
-			},
-		},
-	}
-	// Set Galera instance as the owner and controller
-	err := ctrl.SetControllerReference(m, dep, r.Scheme)
-	if err != nil {
-		return nil
-	}
-	return dep
-}
-
-// labelsForGalera returns the labels for selecting the resources
-// belonging to the given galera CR name.
-func resourceNameForGalera(name string) string {
-	return name + "-galera"
-}
-
-// labelsForGalera returns the labels for selecting the resources
-// belonging to the given galera CR name.
-func labelsForGalera(name string) map[string]string {
-	return map[string]string{"app": resourceNameForGalera(name), "galera_cr": name}
+	return nil
 }
 
 // getPodNames returns the pod names of the array of pods passed in
